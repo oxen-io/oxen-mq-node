@@ -1,9 +1,10 @@
 #include <napi.h>
-#include <iostream>
 #include <oxenmq/connections.h>
 #include <oxenmq/oxenmq.h>
 
 namespace noxenmq {
+
+using namespace std::literals;
 
 namespace {
     template <typename T, typename F>
@@ -24,7 +25,7 @@ namespace {
 }  // namespace
 
 struct ctors {
-    Napi::FunctionReference NConnectionID, NAddress, NMessage, NOxenMQ, NConnectResult;
+    Napi::FunctionReference NConnectionID, NAddress, NMessage, NOxenMQ, NReply;
 };
 
 class NConnectionID : public Napi::ObjectWrap<NConnectionID> {
@@ -211,7 +212,7 @@ class NMessage : public Napi::ObjectWrap<NMessage> {
                 env,
                 "Message",
                 {
-                        InstanceAccessor("isReply", &NMessage::isReply, nullptr),
+                        InstanceAccessor("isRequest", &NMessage::isRequest, nullptr),
                         InstanceAccessor("remoteAddress", &NMessage::remoteAddress, nullptr),
                         InstanceAccessor("conn", &NMessage::conn, nullptr),
                         // Returns a *copy* of the data; oxenmq exposes a view, but it's only valid
@@ -224,7 +225,7 @@ class NMessage : public Napi::ObjectWrap<NMessage> {
         exports.Set("Message", func);
     }
 
-    Napi::Value isReply(const Napi::CallbackInfo& info) {
+    Napi::Value isRequest(const Napi::CallbackInfo& info) {
         return napi_cast<Napi::Boolean>(info, !defer_->reply_tag.empty());
     }
     Napi::Value remoteAddress(const Napi::CallbackInfo& info) {
@@ -238,61 +239,6 @@ class NMessage : public Napi::ObjectWrap<NMessage> {
         return c;
     }
     Napi::Value data(const Napi::CallbackInfo&) { return data_; }
-};
-
-// Return object of connectRemote: this contains the connection id and also allows the caller to
-// await the connection being confirmed established (or failed).
-class NConnectResult : public Napi::ObjectWrap<NConnectResult> {
-    oxenmq::ConnectionID id_;
-    Napi::Promise::Deferred deferred_;
-    friend class NOxenMQ;
-
-  public:
-    NConnectResult(const Napi::CallbackInfo& info) :
-            Napi::ObjectWrap<NConnectResult>{info},
-            id_{*info[0].As<Napi::External<oxenmq::ConnectionID>>().Data()},
-            deferred_{Napi::Promise::Deferred::New(info.Env())} {}
-
-    static void napi_init(Napi::Env& env, Napi::Object& exports, ctors& ct) {
-        Napi::HandleScope scope{env};
-
-        Napi::Function func = DefineClass(
-                env,
-                "ConnectResult",
-                {
-                        InstanceAccessor("id", &NConnectResult::id, nullptr),
-                        InstanceAccessor("connected", &NConnectResult::connected, nullptr),
-                });
-
-        ct.NConnectResult = Napi::Persistent(func);
-
-        exports.Set("ConnectResult", func);
-    }
-
-    Napi::Value id(const Napi::CallbackInfo& info) { return NConnectionID::wrap(info.Env(), id_); }
-    Napi::Value connected(const Napi::CallbackInfo&) { return deferred_.Promise(); }
-
-    using Result = std::pair<oxenmq::ConnectionID, std::optional<std::string>>;
-    // This function is indirectly invoked via a ThreadSafeFunc (below) which is called from a
-    // thread, queues the result, then calls *this* function in the main thread (from which we are
-    // allowed to touch node):
-    static void set_result(
-            Napi::Env env,
-            Napi::Function /*callback*/,
-            NConnectResult* context,
-            Result* resultptr) {
-        if (env == nullptr)
-            return;
-
-        const auto& [connid, failmsg] = *resultptr;
-        if (!failmsg) {
-            context->deferred_.Resolve(NConnectionID::wrap(env, connid));
-        } else {
-            context->deferred_.Reject(napi_cast<Napi::String>(env, *failmsg));
-        }
-        delete resultptr;
-    }
-    using ThreadSafeFunc = Napi::TypedThreadSafeFunction<NConnectResult, Result, set_result>;
 };
 
 class NOxenMQ : public Napi::ObjectWrap<NOxenMQ> {
@@ -345,6 +291,9 @@ class NOxenMQ : public Napi::ObjectWrap<NOxenMQ> {
                         InstanceAccessor("privkey", &NOxenMQ::privkey, nullptr),
                         InstanceMethod("start", &NOxenMQ::start),
                         InstanceMethod("connectRemote", &NOxenMQ::connect_remote),
+                        InstanceMethod("connectRemoteAsync", &NOxenMQ::connect_remote_async),
+                        InstanceMethod("disconnect", &NOxenMQ::disconnect),
+                        InstanceMethod("request", &NOxenMQ::request),
 
                 });
 
@@ -417,31 +366,158 @@ class NOxenMQ : public Napi::ObjectWrap<NOxenMQ> {
     }
     void start(const Napi::CallbackInfo&) { omq->start(); }
 
-    Napi::Value connect_remote(const Napi::CallbackInfo& info) {
+
+    using ConnectResult = std::pair<oxenmq::ConnectionID, std::optional<std::string>>;
+    // This function is indirectly invoked via a ThreadSafeConnectFunc (below) which is called from
+    // a thread, queues the result, then calls *this* function in the main thread (from which we are
+    // allowed to touch node):
+    static void set_connect_result(
+            Napi::Env env,
+            Napi::Function /*callback*/,
+            Napi::Promise::Deferred* context,
+            ConnectResult* resultptr) {
+        if (env == nullptr)
+            return;
+
+        const auto& [connid, failmsg] = *resultptr;
+        if (!failmsg) {
+            context->Resolve(NConnectionID::wrap(env, connid));
+        } else {
+            context->Reject(napi_cast<Napi::String>(env, *failmsg));
+        }
+        delete resultptr;
+        delete context;
+    }
+    using ThreadSafeConnectFunc = Napi::TypedThreadSafeFunction<Napi::Promise::Deferred, ConnectResult, set_connect_result>;
+
+    // The async version returns a promise that resolves to the ConnectionID, once a connection is
+    // fully established.
+    Napi::Value connect_remote_async(const Napi::CallbackInfo& info) {
         if (info.Length() < 1)
             throw std::invalid_argument{"An address is required"};
         NAddress* addr = NAddress::Unwrap(info[0].As<Napi::Object>());
 
         auto env = info.Env();
-        auto result_obj = env.GetInstanceData<ctors>()->NConnectResult.New(
-                {Napi::External<oxenmq::ConnectionID>::New(env, new oxenmq::ConnectionID{})});
+        auto* def = new Napi::Promise::Deferred(Napi::Promise::Deferred::New(env));
 
-        auto f = NConnectResult::ThreadSafeFunc::New(
-                env, "OxenMQ-Connect", 0, 1, NConnectResult::Unwrap(result_obj)
-                /* FIXME - need to cleanup the NConnectResult? */
-        );
+        auto f = ThreadSafeConnectFunc::New(
+                env, "OxenMQ-Connect", 0, 1, def);
 
         auto on_success = [f](oxenmq::ConnectionID c) {
-            f.BlockingCall(new NConnectResult::Result{c, std::nullopt});
+            f.BlockingCall(new ConnectResult{c, std::nullopt});
             f.Release();
         };
         auto on_failure = [f = std::move(f)](oxenmq::ConnectionID c, std::string_view reason) {
-            f.BlockingCall(new NConnectResult::Result{c, std::string{reason}});
+            f.BlockingCall(new ConnectResult{c, std::string{reason}});
             f.Release();
         };
-        auto& conn_id = NConnectResult::Unwrap(result_obj)->id_;
-        conn_id = omq->connect_remote(addr->get(), on_success, on_failure);
-        return result_obj;
+        omq->connect_remote(addr->get(), on_success, on_failure);
+        return def->Promise();
+    }
+
+    // The version starts establishing the connection and returns the ConnectionID immediately.
+    // Messages send to the connection will be queued until the connection is established, then
+    // sent.
+    //
+    // TODO: allow connect/connect_fail callbacks
+    Napi::Value connect_remote(const Napi::CallbackInfo& info) {
+        if (info.Length() < 1)
+            throw std::invalid_argument{"An address is required"};
+        NAddress* addr = NAddress::Unwrap(info[0].As<Napi::Object>());
+
+        auto conn_id = omq->connect_remote(addr->get(), [](auto) {}, [](auto, auto) {});
+        return NConnectionID::wrap(info.Env(), conn_id);
+    }
+
+    void disconnect(const Napi::CallbackInfo& info) {
+        auto* conn = NConnectionID::Unwrap(info[0].As<Napi::Object>());
+        omq->disconnect(conn->get());
+    }
+
+    static void relay_reply(
+            Napi::Env env,
+            Napi::Function /*callback*/,
+            Napi::Promise::Deferred* def,
+            std::pair<bool, std::vector<std::string>>* parts_ptr) {
+        if (env == nullptr)
+            return;
+
+        const auto& [success, parts] = *parts_ptr;
+        auto js_parts = Napi::Array::New(env, parts.size());
+        for (size_t i = 0; i < parts.size(); i++)
+            js_parts[i] = napi_copy_bytes(env, parts[i]);
+
+        if (success)
+            def->Resolve({js_parts});
+        else
+            def->Reject({js_parts});
+
+        delete def;
+    }
+    using ThreadSafeReplyFunc = Napi::TypedThreadSafeFunction<
+            Napi::Promise::Deferred,
+            std::pair<bool, std::vector<std::string>>,
+            relay_reply>;
+
+    Napi::Value request(const Napi::CallbackInfo& info) {
+        // Args:
+        // - connid
+        // - endpoint name, e.g. "category.command"
+        // - array of data parts (Strings or Buffers); can be empty
+        // - optional object of extra options:
+        //   - "timeout" - how long (in ms) to wait for a reply before timing out (default 15s)
+        //
+        // Returns a promise; on success it gives you back an array of data parts, on failure it
+        // gives you an array of error message data parts.
+
+        auto env = info.Env();
+        Napi::HandleScope scope{env};
+
+        auto* conn = NConnectionID::Unwrap(info[0].As<Napi::Object>());
+
+        auto endpoint = info[1].As<Napi::String>().Utf8Value();
+
+        std::vector<std::string> parts_strs;
+        std::vector<std::string_view> parts;
+        auto data_in = info[2].As<Napi::Array>();
+        for (size_t i = 0; i < data_in.Length(); i++) {
+            Napi::Value in = data_in[i];
+            if (in.IsString()) {
+                parts_strs.push_back(in.As<Napi::String>().Utf8Value());
+                parts.emplace_back(parts_strs.back());
+            } else if (in.IsBuffer()) {
+                auto ab = in.As<Napi::Buffer<char>>();
+                parts.emplace_back(ab.Data(), ab.ByteLength());
+            } else
+                throw std::invalid_argument{
+                        "Invalid argument: request data parts must be String or Buffer"};
+        }
+
+        auto def = new Napi::Promise::Deferred(Napi::Promise::Deferred::New(env));
+        auto handle_reply = [reply_relay =
+                                     ThreadSafeReplyFunc::New(env, "OxenMQ-Reply", 0, 1, def)](
+                                    bool success, std::vector<std::string> data) {
+            reply_relay.BlockingCall(new std::pair<bool, std::vector<std::string>>{
+                    std::move(success), std::move(data)});
+            reply_relay.Release();
+        };
+
+        oxenmq::send_option::request_timeout r_timeout{-1ms};
+        if (info.Length() > 3) {
+            auto opts = info[3].As<Napi::Object>();
+            auto timeout = opts.Get("timeout");
+            if (timeout.IsNumber())
+                r_timeout.time = std::chrono::milliseconds{timeout.As<Napi::Number>().Int64Value()};
+        }
+
+        omq->request(
+                conn->get(),
+                endpoint,
+                std::move(handle_reply),
+                oxenmq::send_option::data_parts(parts),
+                r_timeout);
+
+        return def->Promise();
     }
 };
 
@@ -455,7 +531,6 @@ Napi::Object oxenmq_module_init(Napi::Env env, Napi::Object exports) {
     noxenmq::NAddress::napi_init(env, exports, *ctors);
     noxenmq::NMessage::napi_init(env, exports, *ctors);
     noxenmq::NOxenMQ::napi_init(env, exports, *ctors);
-    noxenmq::NConnectResult::napi_init(env, exports, *ctors);
     env.SetInstanceData(ctors);
     return exports;
 }
