@@ -1,0 +1,3 @@
+[submodule "oxen-mq"]
+	path = oxen-mq
+	url = https://github.com/oxen-io/oxen-mq.git

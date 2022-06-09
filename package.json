@@ -1,0 +1,29 @@
+{
+  "name": "oxenmq",
+  "version": "0.0.1",
+  "description": "Node bindings for OxenMQ",
+  "main": "index.js",
+  "scripts": {
+    "build": "cmake-js compile",
+    "clean": "cmake-js clean"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jagerman/oxen-mq-node.git"
+  },
+  "keywords": [
+    "oxen",
+    "oxenmq",
+    "zeromq"
+  ],
+  "author": "Jason Rhinelander <jason@oxen.io>",
+  "license": "GPL-3.0-or-later",
+  "bugs": {
+    "url": "https://github.com/jagerman/oxen-mq-node/issues"
+  },
+  "homepage": "https://github.com/jagerman/oxen-mq-node#readme",
+  "dependencies": {
+    "cmake-js": "^6.3.2",
+    "node-addon-api": "^5.0.0"
+  }
+}
