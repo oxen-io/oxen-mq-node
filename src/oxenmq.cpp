@@ -7,8 +7,12 @@ namespace noxenmq {
 
 namespace {
     template <typename T, typename F>
+    T napi_cast(const Napi::Env& env, F&& value) {
+        return T::New(env, std::forward<F>(value));
+    }
+    template <typename T, typename F>
     T napi_cast(const Napi::CallbackInfo& info, F&& value) {
-        return T::New(info.Env(), std::forward<F>(value));
+        return napi_cast<T>(info.Env(), std::forward<F>(value));
     }
 
     template <typename F>
@@ -20,7 +24,7 @@ namespace {
 }  // namespace
 
 struct ctors {
-    Napi::FunctionReference NConnectionID, NAddress, NMessage, NOxenMQ;
+    Napi::FunctionReference NConnectionID, NAddress, NMessage, NOxenMQ, NConnectResult;
 };
 
 class NConnectionID : public Napi::ObjectWrap<NConnectionID> {
@@ -40,9 +44,10 @@ class NConnectionID : public Napi::ObjectWrap<NConnectionID> {
                 env,
                 "ConnectionID",
                 {
-                        InstanceMethod("isServiceNode", &NConnectionID::isServiceNode),
-                        InstanceMethod("pubkey", &NConnectionID::pubkey),
+                        InstanceAccessor("isServiceNode", &NConnectionID::isServiceNode, nullptr),
+                        InstanceAccessor("pubkey", &NConnectionID::pubkey, nullptr),
                         InstanceMethod("equals", &NConnectionID::equals),
+                        InstanceMethod("toString", &NConnectionID::toString),
                 });
 
         ct.NConnectionID = Napi::Persistent(func);
@@ -60,6 +65,12 @@ class NConnectionID : public Napi::ObjectWrap<NConnectionID> {
         return napi_copy_bytes(info.Env(), instance->pubkey());
     }
 
+    Napi::Value toString(const Napi::CallbackInfo& info) {
+        std::ostringstream o;
+        o << *instance;
+        return napi_cast<Napi::String>(info, o.str());
+    }
+
     Napi::Value equals(const Napi::CallbackInfo& info) {
         auto env = info.Env();
         Napi::HandleScope scope{env};
@@ -74,8 +85,7 @@ class NConnectionID : public Napi::ObjectWrap<NConnectionID> {
     // Copy a oxenmq::ConnectionID into a node-wrapped NConnectionID
     static Napi::Object wrap(const Napi::Env& env, const oxenmq::ConnectionID& conn) {
         return env.GetInstanceData<ctors>()->NConnectionID.New(
-                {Napi::External<oxenmq::ConnectionID>::New(
-                        env, new oxenmq::ConnectionID{conn})});
+                {Napi::External<oxenmq::ConnectionID>::New(env, new oxenmq::ConnectionID{conn})});
     }
 
     friend class NMessage;
@@ -168,14 +178,6 @@ class NAddress : public Napi::ObjectWrap<NAddress> {
         auto* other = Unwrap(info[0].As<Napi::Object>());
         return Napi::Boolean::New(env, instance == other->instance);
     }
-
-    // DEBUG:
-    Napi::Value wtf(const Napi::CallbackInfo& info) {
-        auto env = info.Env();
-        auto obj = env.GetInstanceData<ctors>()->NAddress.New(
-                {Napi::String::New(env, instance.full_address())});
-        return obj;
-    }
 };
 
 // oxenmq::Message is designed to be ephemeral, used only in the callback.  That doesn't fit well at
@@ -236,6 +238,61 @@ class NMessage : public Napi::ObjectWrap<NMessage> {
         return c;
     }
     Napi::Value data(const Napi::CallbackInfo&) { return data_; }
+};
+
+// Return object of connectRemote: this contains the connection id and also allows the caller to
+// await the connection being confirmed established (or failed).
+class NConnectResult : public Napi::ObjectWrap<NConnectResult> {
+    oxenmq::ConnectionID id_;
+    Napi::Promise::Deferred deferred_;
+    friend class NOxenMQ;
+
+  public:
+    NConnectResult(const Napi::CallbackInfo& info) :
+            Napi::ObjectWrap<NConnectResult>{info},
+            id_{*info[0].As<Napi::External<oxenmq::ConnectionID>>().Data()},
+            deferred_{Napi::Promise::Deferred::New(info.Env())} {}
+
+    static void napi_init(Napi::Env& env, Napi::Object& exports, ctors& ct) {
+        Napi::HandleScope scope{env};
+
+        Napi::Function func = DefineClass(
+                env,
+                "ConnectResult",
+                {
+                        InstanceAccessor("id", &NConnectResult::id, nullptr),
+                        InstanceAccessor("connected", &NConnectResult::connected, nullptr),
+                });
+
+        ct.NConnectResult = Napi::Persistent(func);
+
+        exports.Set("ConnectResult", func);
+    }
+
+    Napi::Value id(const Napi::CallbackInfo& info) { return NConnectionID::wrap(info.Env(), id_); }
+    Napi::Value connected(const Napi::CallbackInfo&) { return deferred_.Promise(); }
+
+    using Result = std::pair<oxenmq::ConnectionID, std::optional<std::string>>;
+    // This function is indirectly invoked via a ThreadSafeFunc (below) which is called from a
+    // thread, queues the result, then calls *this* function in the main thread (from which we are
+    // allowed to touch node):
+    static void set_result(
+            Napi::Env env,
+            Napi::Function /*callback*/,
+            NConnectResult* context,
+            Result* resultptr) {
+        if (env == nullptr)
+            return;
+
+        const auto& [connid, failmsg] = *resultptr;
+        if (!failmsg) {
+            context->deferred_.Resolve(NConnectionID::wrap(env, connid));
+        } else {
+            context->deferred_.Reject(napi_cast<Napi::String>(env, *failmsg));
+        }
+        delete resultptr;
+    }
+    using ThreadSafeFunc = Napi::TypedThreadSafeFunction<NConnectResult, Result, set_result>;
 };
 
 class NOxenMQ : public Napi::ObjectWrap<NOxenMQ> {
@@ -358,27 +415,33 @@ class NOxenMQ : public Napi::ObjectWrap<NOxenMQ> {
     Napi::Value privkey(const Napi::CallbackInfo& info) {
         return napi_copy_bytes(info.Env(), omq->get_privkey());
     }
-    void start(const Napi::CallbackInfo&) {
-        omq->start();
-    }
+    void start(const Napi::CallbackInfo&) { omq->start(); }
+
     Napi::Value connect_remote(const Napi::CallbackInfo& info) {
         if (info.Length() < 1)
             throw std::invalid_argument{"An address is required"};
         NAddress* addr = NAddress::Unwrap(info[0].As<Napi::Object>());
 
-        // FIXME: Need to make this async, so that the caller awaits a result that we set from
-        // success/failure callbacks.
-        auto on_success = [](oxenmq::ConnectionID) {
-            std::cerr << "connect success!\n";
-        };
-        auto on_failure = [](oxenmq::ConnectionID, std::string_view reason) {
-            std::cerr << "connection failed: " << reason << "\n";
-        };
-        auto c = omq->connect_remote(addr->get(), on_success, on_failure);
+        auto env = info.Env();
+        auto result_obj = env.GetInstanceData<ctors>()->NConnectResult.New(
+                {Napi::External<oxenmq::ConnectionID>::New(env, new oxenmq::ConnectionID{})});
 
-        // FIXME: what to return?
-        return info.Env().Undefined();
-        //return NConnectionID::wrap(info.Env(), c);
+        auto f = NConnectResult::ThreadSafeFunc::New(
+                env, "OxenMQ-Connect", 0, 1, NConnectResult::Unwrap(result_obj)
+                /* FIXME - need to cleanup the NConnectResult? */
+        );
+
+        auto on_success = [f](oxenmq::ConnectionID c) {
+            f.BlockingCall(new NConnectResult::Result{c, std::nullopt});
+            f.Release();
+        };
+        auto on_failure = [f = std::move(f)](oxenmq::ConnectionID c, std::string_view reason) {
+            f.BlockingCall(new NConnectResult::Result{c, std::string{reason}});
+            f.Release();
+        };
+        auto& conn_id = NConnectResult::Unwrap(result_obj)->id_;
+        conn_id = omq->connect_remote(addr->get(), on_success, on_failure);
+        return result_obj;
     }
 };
 
@@ -392,6 +455,7 @@ Napi::Object oxenmq_module_init(Napi::Env env, Napi::Object exports) {
     noxenmq::NAddress::napi_init(env, exports, *ctors);
     noxenmq::NMessage::napi_init(env, exports, *ctors);
     noxenmq::NOxenMQ::napi_init(env, exports, *ctors);
+    noxenmq::NConnectResult::napi_init(env, exports, *ctors);
     env.SetInstanceData(ctors);
     return exports;
 }
