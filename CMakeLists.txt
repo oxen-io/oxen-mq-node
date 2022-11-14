@@ -8,7 +8,14 @@ add_subdirectory(oxen-mq)
 add_library(${PROJECT_NAME} SHARED src/oxenmq.cpp ${CMAKE_JS_SRC})
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_JS_INC})
 target_link_libraries(${PROJECT_NAME} PRIVATE oxenmq::oxenmq ${CMAKE_JS_LIB})
-set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "" OUTPUT_NAME "oxenmq" SUFFIX ".node")
+set_target_properties(${PROJECT_NAME} PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+  PREFIX ""
+  OUTPUT_NAME "oxenmq"
+  SUFFIX ".node")
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     NAPI_VERSION=6
