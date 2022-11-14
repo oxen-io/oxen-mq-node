@@ -1,3 +1,6 @@
 [submodule "oxen-mq"]
 	path = oxen-mq
 	url = https://github.com/oxen-io/oxen-mq.git
+[submodule "node-api-stub"]
+	path = node-api-stub
+	url = https://github.com/napi-bindings/node-api-stub
